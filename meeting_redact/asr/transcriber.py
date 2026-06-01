@@ -11,9 +11,18 @@ from pathlib import Path
 from typing import Union
 
 import numpy as np
+import torch
 import whisperx
 
 from meeting_redact.config import settings
+
+# PyTorch 2.6 changed torch.load to weights_only=True by default, which breaks
+# pyannote's VAD checkpoint (uses omegaconf types). Allowlist them before load.
+try:
+    from omegaconf import DictConfig, ListConfig
+    torch.serialization.add_safe_globals([DictConfig, ListConfig])
+except (ImportError, AttributeError):
+    pass
 
 
 AudioInput = Union[str, Path, np.ndarray]
