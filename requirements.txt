@@ -3,7 +3,7 @@ torchaudio>=2.2
 nvidia-cudnn-cu12==8.9.7.29
 numpy>=1.26
 whisperx>=3.1.1
-transformers>=4.40
+transformers>=4.47
 tokenizers>=0.19
 accelerate>=0.30
 fastapi>=0.110

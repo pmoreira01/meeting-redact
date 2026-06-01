@@ -5,11 +5,49 @@ Labels: PER, LOC, ORG, MISC  — MISC is dropped by default (not in NER_ENTITY_T
 """
 from __future__ import annotations
 
+import math
+
+import torch
 from transformers import pipeline
 
 from meeting_redact.config import settings
 from meeting_redact.ner.detector import BaseDetector
 from meeting_redact.ner.entity import Entity
+
+
+def _patch_deberta_torchjit() -> None:
+    """Replace make_log_bucket_position with a plain Python equivalent.
+
+    The transformers version is decorated with @torch.jit.script, which causes
+    the CUDA JIT compiler to emit fabs(int64_t) — ambiguous under CUDA 12.x.
+    Swapping it for a regular function avoids the CUDA kernel path entirely
+    while keeping identical numerics and GPU tensor support.
+    """
+    try:
+        import transformers.models.deberta_v2.modeling_deberta_v2 as _m
+
+        def _make_log_bucket_position(relative_pos, bucket_size: int, max_position: int):
+            sign = torch.sign(relative_pos)
+            mid = bucket_size // 2
+            abs_pos = torch.where(
+                (relative_pos < mid) & (relative_pos > -mid),
+                torch.tensor(mid - 1).type_as(relative_pos),
+                torch.abs(relative_pos),
+            )
+            log_pos = (
+                torch.ceil(
+                    torch.log(abs_pos.float() / mid)
+                    / math.log((max_position - 1) / mid)
+                    * (bucket_size // 2 - 1)
+                )
+                + mid
+            )
+            bucket_pos = torch.where(abs_pos <= mid, relative_pos.type_as(log_pos), log_pos * sign)
+            return bucket_pos.long()
+
+        _m.make_log_bucket_position = _make_log_bucket_position
+    except (ImportError, AttributeError):
+        pass
 
 
 class DeBERTaDetector(BaseDetector):
@@ -26,10 +64,11 @@ class DeBERTaDetector(BaseDetector):
         aggregation_strategy: str = settings.NER_AGGREGATION_STRATEGY,
         score_threshold: float = settings.NER_SCORE_THRESHOLD,
         entity_types: tuple[str, ...] = settings.NER_ENTITY_TYPES,
-        device: str = settings.DEVICE,
+        device: str = settings.NER_DEVICE,
     ) -> None:
         self._score_threshold = score_threshold
         self._entity_types = frozenset(entity_types)
+        _patch_deberta_torchjit()
         self._pipe = pipeline(
             "token-classification",
             model=model_name,

@@ -46,6 +46,7 @@ NER_MODEL: str = "Gladiator/microsoft-deberta-v3-large_ner_conll2003"
 NER_AGGREGATION_STRATEGY: str = "simple"
 NER_SCORE_THRESHOLD: float = 0.85
 NER_ENTITY_TYPES: tuple[str, ...] = ("PER", "LOC", "ORG")
+NER_DEVICE: str = DEVICE
 
 # Ensemble routing — kept here so ensemble.py stays config-driven.
 # Maps entity label → model identifier. Future models registered alongside.
