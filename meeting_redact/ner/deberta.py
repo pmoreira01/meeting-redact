@@ -36,26 +36,56 @@ class DeBERTaDetector(BaseDetector):
             aggregation_strategy=aggregation_strategy,
             device=device,
         )
+        # DeBERTa-v3 max is 512 tokens; use char budget ≈ 512 * 4 with overlap
+        # so entities that span a chunk boundary are still caught.
+        max_pos = getattr(self._pipe.model.config, "max_position_embeddings", 512)
+        self._chunk_chars = max_pos * 4
+        self._overlap_chars = 200
 
     def detect(self, text: str) -> list[Entity]:
         if not text.strip():
             return []
 
-        raw = self._pipe(text, tokenizer_kwargs={"truncation": True})
-
         entities: list[Entity] = []
-        for r in raw:
-            if r["entity_group"] not in self._entity_types:
-                continue
-            if r["score"] < self._score_threshold:
-                continue
-            entities.append(
-                Entity(
-                    text=r["word"],
-                    label=r["entity_group"],
-                    start_char=r["start"],
-                    end_char=r["end"],
-                    score=float(r["score"]),
+        seen: set[tuple[int, int]] = set()
+
+        for chunk, offset in self._chunks(text):
+            for r in self._pipe(chunk):
+                if r["entity_group"] not in self._entity_types:
+                    continue
+                if r["score"] < self._score_threshold:
+                    continue
+                abs_start = r["start"] + offset
+                abs_end = r["end"] + offset
+                if (abs_start, abs_end) in seen:
+                    continue
+                seen.add((abs_start, abs_end))
+                entities.append(
+                    Entity(
+                        text=r["word"],
+                        label=r["entity_group"],
+                        start_char=abs_start,
+                        end_char=abs_end,
+                        score=float(r["score"]),
+                    )
                 )
-            )
         return entities
+
+    def _chunks(self, text: str) -> list[tuple[str, int]]:
+        """Split *text* into overlapping chunks, returning (chunk, char_offset) pairs."""
+        if len(text) <= self._chunk_chars:
+            return [(text, 0)]
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(start + self._chunk_chars, len(text))
+            # Break at a word boundary to avoid splitting tokens mid-word.
+            if end < len(text):
+                boundary = text.rfind(" ", start, end)
+                if boundary > start:
+                    end = boundary
+            chunks.append((text[start:end], start))
+            start = end - self._overlap_chars
+            if start < 0:
+                start = 0
+        return chunks
