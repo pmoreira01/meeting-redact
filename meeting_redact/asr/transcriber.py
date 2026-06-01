@@ -29,7 +29,7 @@ def _unsafe_load():
     original = torch.load
 
     def patched(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
+        kwargs["weights_only"] = False
         return original(*args, **kwargs)
 
     torch.load = patched
