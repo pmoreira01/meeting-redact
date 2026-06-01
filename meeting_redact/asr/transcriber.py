@@ -10,19 +10,33 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
 
+import contextlib
+
 import numpy as np
 import torch
 import whisperx
 
 from meeting_redact.config import settings
 
-# PyTorch 2.6 changed torch.load to weights_only=True by default, which breaks
-# pyannote's VAD checkpoint (uses omegaconf types). Allowlist them before load.
-try:
-    from omegaconf import DictConfig, ListConfig
-    torch.serialization.add_safe_globals([DictConfig, ListConfig])
-except (ImportError, AttributeError):
-    pass
+
+@contextlib.contextmanager
+def _unsafe_load():
+    """Temporarily revert torch.load to weights_only=False for pyannote checkpoints.
+
+    PyTorch 2.6 defaulted weights_only=True, breaking pyannote's VAD checkpoint
+    which embeds omegaconf types. Patch is scoped to model loading only.
+    """
+    original = torch.load
+
+    def patched(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original(*args, **kwargs)
+
+    torch.load = patched
+    try:
+        yield
+    finally:
+        torch.load = original
 
 
 AudioInput = Union[str, Path, np.ndarray]
@@ -62,17 +76,18 @@ class Transcriber:
         self.language = language
         self.batch_size = batch_size
 
-        self._model = whisperx.load_model(
-            model_name,
-            device=device,
-            compute_type=compute_type,
-            language=language,
-        )
-        self._align_model, self._align_metadata = whisperx.load_align_model(
-            language_code=language,
-            device=device,
-            model_name=settings.ASR_ALIGN_MODEL,
-        )
+        with _unsafe_load():
+            self._model = whisperx.load_model(
+                model_name,
+                device=device,
+                compute_type=compute_type,
+                language=language,
+            )
+            self._align_model, self._align_metadata = whisperx.load_align_model(
+                language_code=language,
+                device=device,
+                model_name=settings.ASR_ALIGN_MODEL,
+            )
 
     def transcribe(self, audio: AudioInput) -> TranscriptionResult:
         audio_array = self._load_audio(audio)

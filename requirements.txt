@@ -5,7 +5,6 @@ whisperx>=3.1.1
 transformers>=4.40
 tokenizers>=0.19
 accelerate>=0.30
-omegaconf>=2.3
 fastapi>=0.110
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9
