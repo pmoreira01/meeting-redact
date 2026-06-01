@@ -41,7 +41,7 @@ class DeBERTaDetector(BaseDetector):
         if not text.strip():
             return []
 
-        raw = self._pipe(text, truncation=True)
+        raw = self._pipe(text, tokenizer_kwargs={"truncation": True})
 
         entities: list[Entity] = []
         for r in raw:
