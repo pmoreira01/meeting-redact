@@ -6,17 +6,35 @@ fails or returns no word-level data, this module raises.
 """
 from __future__ import annotations
 
+import contextlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
-
-import contextlib
 
 import numpy as np
 import torch
 import whisperx
 
 from meeting_redact.config import settings
+
+
+def _ensure_cudnn_path() -> None:
+    """Prepend the nvidia-cudnn-cu12 lib dir to LD_LIBRARY_PATH if installed.
+
+    PyTorch 2.6 ships with cuDNN 9, but pyannote's bundled VAD checkpoint
+    requires cuDNN 8 (libcudnn_ops_infer.so.8). Installing nvidia-cudnn-cu12
+    provides it; this ensures the dynamic linker can find it without requiring
+    manual LD_LIBRARY_PATH export before every server start.
+    """
+    try:
+        import nvidia.cudnn
+        lib_dir = os.path.join(os.path.dirname(nvidia.cudnn.__file__), "lib")
+        current = os.environ.get("LD_LIBRARY_PATH", "")
+        if lib_dir not in current:
+            os.environ["LD_LIBRARY_PATH"] = f"{lib_dir}:{current}" if current else lib_dir
+    except ImportError:
+        pass
 
 
 @contextlib.contextmanager
@@ -76,6 +94,7 @@ class Transcriber:
         self.language = language
         self.batch_size = batch_size
 
+        _ensure_cudnn_path()
         with _unsafe_load():
             self._model = whisperx.load_model(
                 model_name,
