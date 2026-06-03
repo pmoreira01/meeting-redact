@@ -24,6 +24,8 @@ inspect or reset this mapping when starting a new meeting.
 """
 from __future__ import annotations
 
+import meeting_redact.compat  # noqa: F401 — must run before whisperx/pyannote import torchaudio
+
 import base64
 import dataclasses
 import io
