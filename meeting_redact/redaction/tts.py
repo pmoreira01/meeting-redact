@@ -23,7 +23,8 @@ class TTSReplacer:
     def __init__(self) -> None:
         from kokoro import KPipeline  # lazy — downloads weights on first call
 
-        self._pipeline = KPipeline(lang_code="a")  # "a" = American English
+        device = settings.DEVICE if settings.DEVICE != "cuda" else "cpu"
+        self._pipeline = KPipeline(lang_code="a", device=device)  # "a" = American English
         self._voice = settings.TTS_VOICE
 
     def synthesize(
