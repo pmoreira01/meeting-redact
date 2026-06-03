@@ -2,13 +2,18 @@
 
 Model: Gladiator/microsoft-deberta-v3-large_ner_conll2003
 Labels: PER, LOC, ORG, MISC  — MISC is dropped by default (not in NER_ENTITY_TYPES).
+
+Uses AutoTokenizer + AutoModelForTokenClassification directly to avoid importing
+transformers.pipelines, which unconditionally pulls in torchvision regardless of
+whether image pipelines are used.
 """
 from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
-from transformers.pipelines import pipeline
+from transformers import AutoModelForTokenClassification, AutoTokenizer
 
 from meeting_redact.config import settings
 from meeting_redact.ner.detector import BaseDetector
@@ -53,9 +58,9 @@ def _patch_deberta_torchjit() -> None:
 class DeBERTaDetector(BaseDetector):
     """Token-classification pipeline backed by DeBERTa-v3-large.
 
-    The transformers pipeline is loaded once at construction and reused.
-    Results are filtered to the configured entity types and score threshold
-    before being returned as Entity objects.
+    Inference is performed directly with AutoModelForTokenClassification and
+    AutoTokenizer so that transformers.pipelines (and its torchvision import)
+    is never loaded.  BIO aggregation (simple strategy) is implemented here.
     """
 
     def __init__(
@@ -68,17 +73,23 @@ class DeBERTaDetector(BaseDetector):
     ) -> None:
         self._score_threshold = score_threshold
         self._entity_types = frozenset(entity_types)
+
         _patch_deberta_torchjit()
-        self._pipe = pipeline(
-            "token-classification",
-            model=model_name,
-            aggregation_strategy=aggregation_strategy,
-            device=device,
-        )
+
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._model = AutoModelForTokenClassification.from_pretrained(model_name)
+
+        actual_device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+        self._device = torch.device(actual_device)
+        self._model.to(self._device).eval()
+
+        self._id2label: dict[int, str] = self._model.config.id2label
+
         # DeBERTa-v3 max is 512 tokens; use char budget ≈ 512 * 4 with overlap
         # so entities that span a chunk boundary are still caught.
-        max_pos = getattr(self._pipe.model.config, "max_position_embeddings", 512)
-        self._chunk_chars = max_pos * 4
+        max_pos = getattr(self._model.config, "max_position_embeddings", 512)
+        self._max_tokens = max_pos - 2  # reserve for [CLS] / [SEP]
+        self._chunk_chars = self._max_tokens * 4
         self._overlap_chars = 200
 
     def detect(self, text: str) -> list[Entity]:
@@ -89,26 +100,92 @@ class DeBERTaDetector(BaseDetector):
         seen: set[tuple[int, int]] = set()
 
         for chunk, offset in self._chunks(text):
-            for r in self._pipe(chunk):
-                if r["entity_group"] not in self._entity_types:
-                    continue
-                if r["score"] < self._score_threshold:
-                    continue
-                abs_start = r["start"] + offset
-                abs_end = r["end"] + offset
-                if (abs_start, abs_end) in seen:
-                    continue
-                seen.add((abs_start, abs_end))
-                entities.append(
-                    Entity(
-                        text=r["word"],
-                        label=r["entity_group"],
-                        start_char=abs_start,
-                        end_char=abs_end,
-                        score=float(r["score"]),
-                    )
-                )
+            for entity in self._run_chunk(chunk, offset):
+                key = (entity.start_char, entity.end_char)
+                if key not in seen:
+                    seen.add(key)
+                    entities.append(entity)
+
         return entities
+
+    # ---------------------------------------------------------------------------
+    # Internal helpers
+    # ---------------------------------------------------------------------------
+
+    def _run_chunk(self, text: str, char_offset: int) -> list[Entity]:
+        """Run inference on one chunk and return Entity objects."""
+        encoding = self._tokenizer(
+            text,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            truncation=True,
+            max_length=self._max_tokens + 2,
+        )
+        offset_mapping: list[tuple[int, int]] = encoding.pop("offset_mapping")[0].tolist()
+
+        inputs = {k: v.to(self._device) for k, v in encoding.items()}
+        with torch.no_grad():
+            logits = self._model(**inputs).logits[0]  # (seq_len, num_labels)
+
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        pred_ids: np.ndarray = probs.argmax(axis=-1)
+
+        raw: list[Entity] = []
+        current: dict | None = None
+
+        for i, (tok_start, tok_end) in enumerate(offset_mapping):
+            if tok_start == tok_end:  # special token ([CLS], [SEP], padding)
+                if current is not None:
+                    raw.append(self._close(current, text, char_offset))
+                    current = None
+                continue
+
+            label_full = self._id2label[int(pred_ids[i])]
+            score = float(probs[i, int(pred_ids[i])])
+
+            if label_full == "O":
+                if current is not None:
+                    raw.append(self._close(current, text, char_offset))
+                    current = None
+                continue
+
+            # Parse optional BIO prefix (B-PER, I-PER, or bare PER).
+            if "-" in label_full:
+                bio, entity_type = label_full.split("-", 1)
+            else:
+                bio, entity_type = "B", label_full
+
+            if current is None or bio == "B" or entity_type != current["label"]:
+                if current is not None:
+                    raw.append(self._close(current, text, char_offset))
+                current = {
+                    "label": entity_type,
+                    "start": tok_start,
+                    "end": tok_end,
+                    "scores": [score],
+                }
+            else:
+                current["end"] = tok_end
+                current["scores"].append(score)
+
+        if current is not None:
+            raw.append(self._close(current, text, char_offset))
+
+        return [
+            e for e in raw
+            if e.label in self._entity_types and e.score >= self._score_threshold
+        ]
+
+    @staticmethod
+    def _close(current: dict, text: str, char_offset: int) -> Entity:
+        span_text = text[current["start"]:current["end"]].strip()
+        return Entity(
+            text=span_text,
+            label=current["label"],
+            start_char=current["start"] + char_offset,
+            end_char=current["end"] + char_offset,
+            score=float(np.mean(current["scores"])),
+        )
 
     def _chunks(self, text: str) -> list[tuple[str, int]]:
         """Split *text* into overlapping chunks, returning (chunk, char_offset) pairs."""
@@ -118,7 +195,6 @@ class DeBERTaDetector(BaseDetector):
         start = 0
         while start < len(text):
             end = min(start + self._chunk_chars, len(text))
-            # Break at a word boundary to avoid splitting tokens mid-word.
             if end < len(text):
                 boundary = text.rfind(" ", start, end)
                 if boundary > start:
