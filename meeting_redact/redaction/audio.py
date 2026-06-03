@@ -49,8 +49,12 @@ def redact(
     pad = int(padding_ms * sample_rate / 1_000)
 
     for entity in entities:
-        start = max(0, int(entity.start_time * sample_rate) - pad)
-        end = min(len(result), int(entity.end_time * sample_rate) + pad)
+        # TTS spans use no padding — adding silence before/after the replacement
+        # creates an audible gap. Silence/beep still benefit from padding to
+        # cover any slight timestamp inaccuracy at word boundaries.
+        effective_pad = 0 if method == "tts" else pad
+        start = max(0, int(entity.start_time * sample_rate) - effective_pad)
+        end = min(len(result), int(entity.end_time * sample_rate) + effective_pad)
 
         if start >= end:
             continue

@@ -62,6 +62,9 @@ class TTSReplacer:
             import librosa
             wav = librosa.resample(wav, orig_sr=_MODEL_SAMPLE_RATE, target_sr=sample_rate)
 
+        # Strip leading/trailing silence added by Kokoro so speech starts immediately.
+        wav = _trim_silence(wav, sample_rate=sample_rate)
+
         return _fit_to_samples(wav, target_samples)
 
 
@@ -98,6 +101,28 @@ def _fit_to_samples(audio: np.ndarray, target: int) -> np.ndarray:
     if fade_len > 0:
         truncated[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
     return truncated
+
+
+def _trim_silence(
+    audio: np.ndarray,
+    sample_rate: int,
+    threshold: float = 0.015,
+    keep_ms: int = 8,
+) -> np.ndarray:
+    """Remove leading and trailing silence from TTS output.
+
+    Args:
+        threshold: Amplitude below which a sample is considered silent.
+        keep_ms: Milliseconds of pre/post-speech audio to retain so the
+                 speech doesn't start with a hard transient.
+    """
+    keep = int(keep_ms * sample_rate / 1000)
+    above = np.abs(audio) > threshold
+    if not above.any():
+        return audio
+    start = max(0, int(above.argmax()) - keep)
+    end = min(len(audio), int(len(above) - above[::-1].argmax()) + keep)
+    return audio[start:end]
 
 
 def _pad_or_truncate(audio: np.ndarray, target: int) -> np.ndarray:
