@@ -2,7 +2,7 @@ torch>=2.2
 torchaudio>=2.2
 nvidia-cudnn-cu12==8.9.7.29
 numpy>=1.26
-whisperx>=3.1.1
+whisperx>=3.4.5
 transformers>=4.47
 tokenizers>=0.19
 accelerate>=0.30
@@ -12,5 +12,11 @@ python-multipart>=0.0.9
 pydantic>=2.6
 httpx>=0.27
 pytest>=8.0
-chatterbox-tts>=0.1.1
+librosa>=0.10.0
 scipy>=1.12
+# chatterbox-tts runtime deps (install the package itself separately — see below)
+s3tokenizer
+conformer==0.3.2
+resemble-perth>=1.0.0
+pyloudnorm
+diffusers>=0.29.0
