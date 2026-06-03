@@ -1,5 +1,6 @@
 torch>=2.2
 torchaudio>=2.2
+torchvision>=0.27.0
 nvidia-cudnn-cu12==8.9.7.29
 numpy>=1.26
 whisperx>=3.4.5
