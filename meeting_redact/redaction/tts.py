@@ -1,11 +1,11 @@
-"""Standard TTS replacement — Chatterbox TTS (no voice cloning).
+"""Standard TTS replacement — Kokoro ONNX.
 
-Synthesizes a spoken anonymization label (e.g. "person one") using
-Chatterbox's default voice, then fits the output to the target duration
-via time-stretching or zero-padding so the audio timeline is preserved.
+Synthesizes spoken anonymization labels (e.g. "Rachel Simmons") using
+Kokoro's neural voices via ONNX Runtime.  No voice cloning — consistent,
+high-quality output on CPU without GPU or iterative diffusion sampling.
 
-The spoken text is supplied by the caller (resolved via EntityRegistry) so
-that repeated occurrences of the same entity always produce the same label.
+Model weights are downloaded automatically from HuggingFace on first use
+and cached in the HuggingFace cache directory.
 """
 from __future__ import annotations
 
@@ -13,21 +13,21 @@ import numpy as np
 
 from meeting_redact.config import settings
 
-# Chatterbox TTS outputs at 22050 Hz.
-_MODEL_SAMPLE_RATE = 22_050
+# Kokoro ONNX outputs at 24 kHz.
+_MODEL_SAMPLE_RATE = 24_000
 
 
 class TTSReplacer:
-    """Standard TTS replacer backed by Chatterbox TTS (default voice).
+    """TTS replacer backed by Kokoro ONNX (default neural voice).
 
-    The model is loaded once at construction time.  Call :meth:`synthesize`
-    per entity to obtain a duration-matched replacement waveform.
+    Loaded once at startup.  Call :meth:`synthesize` per entity.
     """
 
     def __init__(self) -> None:
-        from chatterbox.tts import ChatterboxTTS  # lazy — heavyweight dep
+        from kokoro_onnx import Kokoro  # lazy — downloads weights on first call
 
-        self._model = ChatterboxTTS.from_pretrained(device=settings.DEVICE)
+        self._kokoro = Kokoro.from_pretrained()
+        self._voice = settings.TTS_VOICE
 
     def synthesize(
         self,
@@ -35,31 +35,32 @@ class TTSReplacer:
         duration_sec: float,
         sample_rate: int = settings.ASR_SAMPLE_RATE,
     ) -> np.ndarray:
-        """Return float32 mono audio of *spoken_text* in the default voice.
-
-        The returned array has exactly ``round(duration_sec * sample_rate)``
-        samples — duration is always preserved by stretching or padding.
+        """Return float32 mono audio of *spoken_text* fitted to *duration_sec*.
 
         Args:
-            spoken_text: Text to synthesize, e.g. "Rachel Simmons".  Resolved
-                by the caller via :class:`EntityRegistry`.
+            spoken_text: Text to synthesize, e.g. "Rachel Simmons".
             duration_sec: Target span length in seconds.
             sample_rate: Pipeline sample rate (default 16 kHz).
         """
         target_samples = round(duration_sec * sample_rate)
 
-        wav_tensor = self._model.generate(spoken_text)  # type: ignore[attr-defined]
-        wav = wav_tensor.squeeze().cpu().numpy().astype(np.float32)
+        samples, sr = self._kokoro.create(
+            spoken_text,
+            voice=self._voice,
+            speed=1.0,
+            lang="en-us",
+        )
+        wav = np.array(samples, dtype=np.float32)
 
-        # Normalise amplitude — Chatterbox can produce values outside [-1, 1].
+        # Normalise — prevent clipping when converting to int16 later.
         peak = np.abs(wav).max()
         if peak > 1e-6:
             wav = wav / peak * 0.85
 
-        # High-quality resampling via librosa (avoids FFT ringing from scipy).
-        if _MODEL_SAMPLE_RATE != sample_rate:
+        # Resample from model rate to pipeline rate using high-quality resampler.
+        if sr != sample_rate:
             import librosa
-            wav = librosa.resample(wav, orig_sr=_MODEL_SAMPLE_RATE, target_sr=sample_rate)
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=sample_rate)
 
         return _fit_to_samples(wav, target_samples)
 
@@ -71,32 +72,27 @@ class TTSReplacer:
 def _fit_to_samples(audio: np.ndarray, target: int) -> np.ndarray:
     """Fit *audio* to exactly *target* samples without aggressive distortion.
 
-    Strategy:
-    - TTS shorter than span  → zero-pad (silence after the spoken name).
-    - TTS up to 2× longer    → gentle time-stretch to fill the span.
-    - TTS more than 2× longer → hard-truncate with a 50 ms fade-out so the
-      cut sounds like a natural end rather than a glitch.
+    - Shorter than span  → zero-pad (silence after speech).
+    - Up to 2× longer   → gentle time-stretch via librosa.
+    - More than 2× longer → truncate with 50 ms fade-out to avoid hard cut.
     """
     if len(audio) == target:
         return audio
 
     if len(audio) < target:
-        # Pad with silence — name was shorter than the original entity span.
         return np.concatenate([audio, np.zeros(target - len(audio), dtype=np.float32)])
 
-    ratio = len(audio) / target  # > 1: TTS is longer than span
+    ratio = len(audio) / target  # > 1: TTS longer than span
 
     if ratio <= 2.0:
         try:
             import librosa
             stretched = librosa.effects.time_stretch(audio, rate=ratio)
-            # time_stretch result may be ±1 sample off target.
             return _pad_or_truncate(stretched, target)
         except Exception:
             pass
 
-    # TTS much longer than span: take the first target samples and fade out
-    # over the last 50 ms to avoid a hard-cut glitch.
+    # Too long to stretch cleanly — truncate with a short fade-out.
     truncated = audio[:target].copy()
     fade_len = min(int(0.05 * target), target)
     if fade_len > 0:

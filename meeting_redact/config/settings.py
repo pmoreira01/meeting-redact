@@ -68,9 +68,10 @@ REDACTION_PRESERVE_DURATION: bool = True
 
 
 # ---------------------------------------------------------------------------
-# TTS replacement (Chatterbox)
+# TTS replacement (Kokoro)
 # ---------------------------------------------------------------------------
-TTS_ENABLED: bool = True  # set False to skip loading the TTS model at startup
+TTS_ENABLED: bool = True   # set False to skip loading the TTS model at startup
+TTS_VOICE: str = "af_heart"  # Kokoro voice ID — af_heart, af_bella, am_adam, am_michael …
 
 
 # ---------------------------------------------------------------------------
