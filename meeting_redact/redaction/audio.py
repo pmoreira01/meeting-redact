@@ -42,19 +42,8 @@ def redact(
     if audio.dtype != np.float32:
         audio = audio.astype(np.float32)
 
-    if method == "tts":
-        if tts_replacer is None:
-            raise ValueError("tts_replacer must be provided when method='tts'.")
-        # Build voice reference once from non-entity regions.
-        pad = int(padding_ms * sample_rate / 1_000)
-        voice_ref = _extract_voice_reference(
-            audio,
-            sample_rate,
-            entities,
-            padding_samples=pad,
-            min_sec=settings.TTS_VOICE_REF_MIN_SEC,
-            max_sec=settings.TTS_VOICE_REF_MAX_SEC,
-        )
+    if method == "tts" and tts_replacer is None:
+        raise ValueError("tts_replacer must be provided when method='tts'.")
 
     result = audio.copy()
     pad = int(padding_ms * sample_rate / 1_000)
@@ -77,7 +66,6 @@ def redact(
             replacement = tts_replacer.synthesize(  # type: ignore[union-attr]
                 spoken_text=spoken,
                 duration_sec=span_len / sample_rate,
-                reference_audio=voice_ref,  # type: ignore[possibly-undefined]
                 sample_rate=sample_rate,
             )
             result[start:end] = replacement
@@ -102,58 +90,3 @@ def _generate_beep(n_samples: int, sample_rate: int) -> np.ndarray:
     )
 
 
-def _extract_voice_reference(
-    audio: np.ndarray,
-    sample_rate: int,
-    entities: list[Entity],
-    padding_samples: int,
-    min_sec: float,
-    max_sec: float,
-) -> np.ndarray:
-    """Collect non-entity audio as a voice reference for TTS cloning.
-
-    Segments outside every entity span (plus padding) are concatenated up to
-    *max_sec*.  If the total non-entity audio is shorter than *min_sec*, the
-    full audio is used as a fallback — enough for reasonable voice cloning.
-    """
-    max_samples = round(max_sec * sample_rate)
-
-    if not entities:
-        return audio[:max_samples]
-
-    # Build padded, clamped exclusion intervals.
-    excluded: list[tuple[int, int]] = []
-    for e in entities:
-        s = max(0, round(e.start_time * sample_rate) - padding_samples)
-        en = min(len(audio), round(e.end_time * sample_rate) + padding_samples)
-        excluded.append((s, en))
-
-    # Merge overlapping intervals.
-    excluded.sort()
-    merged: list[list[int]] = []
-    for s, en in excluded:
-        if merged and s <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], en)
-        else:
-            merged.append([s, en])
-
-    # Collect the gaps between excluded intervals.
-    segments: list[np.ndarray] = []
-    total = 0
-    prev = 0
-    for s, en in merged:
-        if prev < s:
-            seg = audio[prev:s]
-            segments.append(seg)
-            total += len(seg)
-        prev = en
-    if prev < len(audio):
-        seg = audio[prev:]
-        segments.append(seg)
-        total += len(seg)
-
-    if not segments or total < round(min_sec * sample_rate):
-        return audio[:max_samples]
-
-    reference = np.concatenate(segments)
-    return reference[:max_samples]

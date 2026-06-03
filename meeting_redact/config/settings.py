@@ -71,8 +71,6 @@ REDACTION_PRESERVE_DURATION: bool = True
 # TTS replacement (Chatterbox)
 # ---------------------------------------------------------------------------
 TTS_ENABLED: bool = True  # set False to skip loading the TTS model at startup
-TTS_VOICE_REF_MIN_SEC: float = 3.0   # minimum voice-reference duration
-TTS_VOICE_REF_MAX_SEC: float = 30.0  # maximum voice-reference duration collected
 
 
 # ---------------------------------------------------------------------------
