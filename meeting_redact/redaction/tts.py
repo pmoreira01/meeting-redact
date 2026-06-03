@@ -1,11 +1,8 @@
-"""Standard TTS replacement — Kokoro ONNX.
+"""Standard TTS replacement — Kokoro (PyTorch).
 
 Synthesizes spoken anonymization labels (e.g. "Rachel Simmons") using
-Kokoro's neural voices via ONNX Runtime.  No voice cloning — consistent,
-high-quality output on CPU without GPU or iterative diffusion sampling.
-
-Model weights are downloaded automatically from HuggingFace on first use
-and cached in the HuggingFace cache directory.
+Kokoro's neural voices.  Model weights are downloaded automatically from
+hexgrad/Kokoro-82M on HuggingFace and cached on first use.
 """
 from __future__ import annotations
 
@@ -13,23 +10,20 @@ import numpy as np
 
 from meeting_redact.config import settings
 
-# Kokoro ONNX outputs at 24 kHz.
+# Kokoro outputs at 24 kHz.
 _MODEL_SAMPLE_RATE = 24_000
 
 
 class TTSReplacer:
-    """TTS replacer backed by Kokoro ONNX (default neural voice).
+    """TTS replacer backed by Kokoro (PyTorch, default neural voice).
 
     Loaded once at startup.  Call :meth:`synthesize` per entity.
     """
 
     def __init__(self) -> None:
-        from huggingface_hub import hf_hub_download
-        from kokoro_onnx import Kokoro
+        from kokoro import KPipeline  # lazy — downloads weights on first call
 
-        model_path = hf_hub_download(repo_id="hexgrad/Kokoro-82M", filename="kokoro-v1.0.onnx")
-        voices_path = hf_hub_download(repo_id="hexgrad/Kokoro-82M", filename="voices-v1.0.bin")
-        self._kokoro = Kokoro(model_path, voices_path)
+        self._pipeline = KPipeline(lang_code="a")  # "a" = American English
         self._voice = settings.TTS_VOICE
 
     def synthesize(
@@ -47,23 +41,25 @@ class TTSReplacer:
         """
         target_samples = round(duration_sec * sample_rate)
 
-        samples, sr = self._kokoro.create(
-            spoken_text,
-            voice=self._voice,
-            speed=1.0,
-            lang="en-us",
-        )  # sr is always 24000 for Kokoro ONNX
-        wav = np.array(samples, dtype=np.float32)
+        chunks: list[np.ndarray] = []
+        for _, _, audio in self._pipeline(spoken_text, voice=self._voice, speed=1.0):
+            if audio is not None:
+                chunks.append(np.asarray(audio, dtype=np.float32))
+
+        if not chunks:
+            return np.zeros(target_samples, dtype=np.float32)
+
+        wav = np.concatenate(chunks)
 
         # Normalise — prevent clipping when converting to int16 later.
         peak = np.abs(wav).max()
         if peak > 1e-6:
             wav = wav / peak * 0.85
 
-        # Resample from model rate to pipeline rate using high-quality resampler.
-        if sr != sample_rate:
+        # Resample from model rate to pipeline rate via high-quality resampler.
+        if _MODEL_SAMPLE_RATE != sample_rate:
             import librosa
-            wav = librosa.resample(wav, orig_sr=sr, target_sr=sample_rate)
+            wav = librosa.resample(wav, orig_sr=_MODEL_SAMPLE_RATE, target_sr=sample_rate)
 
         return _fit_to_samples(wav, target_samples)
 
@@ -85,7 +81,7 @@ def _fit_to_samples(audio: np.ndarray, target: int) -> np.ndarray:
     if len(audio) < target:
         return np.concatenate([audio, np.zeros(target - len(audio), dtype=np.float32)])
 
-    ratio = len(audio) / target  # > 1: TTS longer than span
+    ratio = len(audio) / target
 
     if ratio <= 2.0:
         try:
