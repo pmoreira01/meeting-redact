@@ -24,9 +24,12 @@ class TTSReplacer:
     """
 
     def __init__(self) -> None:
-        from kokoro_onnx import Kokoro  # lazy — downloads weights on first call
+        from huggingface_hub import hf_hub_download
+        from kokoro_onnx import Kokoro
 
-        self._kokoro = Kokoro.from_pretrained()
+        model_path = hf_hub_download(repo_id="hexgrad/Kokoro-82M", filename="kokoro-v1.0.onnx")
+        voices_path = hf_hub_download(repo_id="hexgrad/Kokoro-82M", filename="voices-v1.0.bin")
+        self._kokoro = Kokoro(model_path, voices_path)
         self._voice = settings.TTS_VOICE
 
     def synthesize(
@@ -49,7 +52,7 @@ class TTSReplacer:
             voice=self._voice,
             speed=1.0,
             lang="en-us",
-        )
+        )  # sr is always 24000 for Kokoro ONNX
         wav = np.array(samples, dtype=np.float32)
 
         # Normalise — prevent clipping when converting to int16 later.
