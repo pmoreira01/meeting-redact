@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 
 import torch
-from transformers import pipeline
+from transformers.pipelines import pipeline
 
 from meeting_redact.config import settings
 from meeting_redact.ner.detector import BaseDetector
