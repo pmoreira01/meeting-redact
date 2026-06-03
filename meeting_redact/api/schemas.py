@@ -18,6 +18,7 @@ class EntityOut(BaseModel):
     score: float
     start_time: float
     end_time: float
+    anonymized_as: str
 
 
 class TranscribeResponse(BaseModel):

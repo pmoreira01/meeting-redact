@@ -15,10 +15,17 @@ Decode on the client::
 
     import base64, json
     entities = json.loads(base64.b64decode(response.headers["X-Entities"]))
+
+Session entity registry
+-----------------------
+The server keeps a persistent entity-to-anonymized-label mapping across all
+requests (e.g. "John Smith" → "person one").  Use the /session endpoints to
+inspect or reset this mapping when starting a new meeting.
 """
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import json
 import tempfile
@@ -37,6 +44,8 @@ from meeting_redact.ner import DeBERTaDetector
 from meeting_redact.ner.entity import Entity
 from meeting_redact.redaction import assign_timestamps
 from meeting_redact.redaction import redact as _redact_audio
+from meeting_redact.redaction.registry import EntityRegistry
+from meeting_redact.redaction.tts import TTSReplacer
 from meeting_redact.api.schemas import EntityOut, TranscribeResponse, WordOut
 
 
@@ -48,6 +57,8 @@ from meeting_redact.api.schemas import EntityOut, TranscribeResponse, WordOut
 async def lifespan(app: FastAPI):
     app.state.transcriber = Transcriber()
     app.state.detector = DeBERTaDetector()
+    app.state.tts_replacer = TTSReplacer() if settings.TTS_ENABLED else None
+    app.state.entity_registry = EntityRegistry()
     yield
 
 
@@ -79,17 +90,21 @@ async def transcribe(
 ):
     """Transcribe *audio* and return the transcript, word timestamps, and detected entities.
 
-    No audio is modified — this is a read-only analysis endpoint.
+    Detected entities are assigned consistent anonymized labels from the
+    session registry (same label as would be used by /redact).
+    No audio is modified.
     """
     _validate_content_type(audio.content_type)
     audio_array = await _read_audio(audio)
 
     transcriber: Transcriber = request.app.state.transcriber
     detector: DeBERTaDetector = request.app.state.detector
+    registry: EntityRegistry = request.app.state.entity_registry
 
     result = transcriber.transcribe(audio_array)
     entities = detector.detect(result.text)
     entities = assign_timestamps(entities, result.words)
+    entities = _assign_anonymized_labels(entities, registry)
 
     return TranscribeResponse(
         text=result.text,
@@ -105,7 +120,7 @@ async def redact(
     audio: UploadFile = File(..., description="Audio file (WAV or MP3)"),
     method: str = Form(
         default=settings.REDACTION_METHOD,
-        description="Redaction method: 'silence' or 'beep'.",
+        description="Redaction method: 'silence', 'beep', or 'tts'.",
     ),
     entity_types: str = Form(
         default=",".join(settings.NER_ENTITY_TYPES),
@@ -113,6 +128,10 @@ async def redact(
     ),
 ):
     """Redact PII from *audio* and return the processed WAV.
+
+    Entities are assigned consistent session-level anonymized labels before
+    redaction so that the same person/location/org always maps to the same
+    label — both in the audio (TTS method) and in the X-Entities metadata.
 
     The list of redacted entities is in the ``X-Entities`` response header
     (Base64-encoded UTF-8 JSON).
@@ -126,13 +145,28 @@ async def redact(
 
     transcriber: Transcriber = request.app.state.transcriber
     detector: DeBERTaDetector = request.app.state.detector
+    registry: EntityRegistry = request.app.state.entity_registry
 
     result = transcriber.transcribe(audio_array)
     entities = detector.detect(result.text)
     entities = [e for e in entities if e.label in requested]
     entities = assign_timestamps(entities, result.words)
+    entities = _assign_anonymized_labels(entities, registry)
 
-    redacted = _redact_audio(audio_array, settings.ASR_SAMPLE_RATE, entities, method=method)
+    tts_replacer = request.app.state.tts_replacer
+    if method == "tts" and tts_replacer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="TTS model is not loaded. Set TTS_ENABLED=True and restart.",
+        )
+
+    redacted = _redact_audio(
+        audio_array,
+        settings.ASR_SAMPLE_RATE,
+        entities,
+        method=method,
+        tts_replacer=tts_replacer,
+    )
     wav_bytes = _to_wav(redacted, settings.ASR_SAMPLE_RATE)
 
     entities_header = base64.b64encode(
@@ -150,8 +184,46 @@ async def redact(
 
 
 # ---------------------------------------------------------------------------
+# Session management endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/session/entity-map")
+async def get_entity_map(request: Request):
+    """Return the current session entity registry.
+
+    Shows every entity surface form seen so far and the anonymized label it
+    has been assigned.  Example::
+
+        {"john smith (per)": "person one", "acme corp (org)": "organization one"}
+    """
+    registry: EntityRegistry = request.app.state.entity_registry
+    return registry.snapshot()
+
+
+@app.delete("/session/entity-map", status_code=204)
+async def reset_entity_map(request: Request):
+    """Clear the session entity registry.
+
+    Call this at the start of a new meeting so entity numbering resets to
+    "person one", "organization one", etc.
+    """
+    registry: EntityRegistry = request.app.state.entity_registry
+    registry.clear()
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _assign_anonymized_labels(
+    entities: list[Entity], registry: EntityRegistry
+) -> list[Entity]:
+    """Return entities with ``anonymized_as`` populated from the registry."""
+    return [
+        dataclasses.replace(e, anonymized_as=registry.get_or_assign(e.text, e.label))
+        for e in entities
+    ]
+
 
 def _validate_content_type(content_type: str | None) -> None:
     allowed = set(settings.API_ALLOWED_AUDIO_TYPES) | {"application/octet-stream"}
@@ -166,10 +238,10 @@ def _validate_content_type(content_type: str | None) -> None:
 
 
 def _validate_method(method: str) -> None:
-    if method not in ("silence", "beep"):
+    if method not in ("silence", "beep", "tts"):
         raise HTTPException(
             status_code=422,
-            detail=f"method must be 'silence' or 'beep', got {method!r}.",
+            detail=f"method must be 'silence', 'beep', or 'tts', got {method!r}.",
         )
 
 
@@ -220,4 +292,5 @@ def _entity_out(e: Entity) -> EntityOut:
         score=e.score,
         start_time=e.start_time,
         end_time=e.end_time,
+        anonymized_as=e.anonymized_as,
     )
